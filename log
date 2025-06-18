@@ -1,0 +1,36 @@
+Network Experimentation Framework
+===================================
+Starting network benchmarks with 1000 simulated clients...
+
+=== TCP Benchmark ===
+Protocol: TCP
+Total Requests: 100000
+Successful Requests: 100000
+Success Rate: 100%
+Average Latency: 7.37291 ms
+Min Latency: 0.014 ms
+P50 Latency: 1.248 ms
+P95 Latency: 2.46 ms
+P99 Latency: 15.663 ms
+Max Latency: 1206.92 ms
+Throughput: 141.942 MB/s
+Connection Establishment Latency (avg): 0.042741 ms
+Connection Establishment Latency (P50): 0.028 ms
+Connection Establishment Latency (P95): 0.05 ms
+Connection Establishment Latency (P99): 0.21 ms
+Successful Connections: 1000/1000
+
+
+=== UDP Benchmark ===
+Protocol: UDP
+Total Requests: 10000
+Successful Requests: 10000
+Success Rate: 100%
+Average Latency: 0.519304 ms
+Min Latency: 0.015 ms
+P50 Latency: 0.418 ms
+P95 Latency: 1.257 ms
+P99 Latency: 1.973 ms
+Max Latency: 3.963 ms
+Throughput: 238.186 MB/s
+
