@@ -11,4 +11,4 @@ This uses epoll to monitor clients, which is a Linux kernel feature.
 ## Why was this made?
 So we were tasked with testing different network protocols to optimise transfers within, to and from a trade data engine. This is not the final implementation, just some experiments.
 ## License and attribution?
-MIT
+MIT. Made by @Algorysh and @manogyasingh
