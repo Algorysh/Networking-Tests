@@ -9,6 +9,7 @@
 #include <vector>
 #include <chrono>
 #include <atomic>
+#include <signal.h>
 
 const int MAX_EVENTS = 1024;
 const int BUFFER_SIZE = 1024;
@@ -32,6 +33,9 @@ public:
     }
 
     bool initialize() {
+        // Ignore SIGPIPE to prevent crashes on broken connections
+        signal(SIGPIPE, SIG_IGN);
+        
         // Create epoll instance
         epoll_fd = epoll_create1(0);
         if (epoll_fd == -1) {
@@ -107,6 +111,10 @@ public:
         int flags = fcntl(udp_fd, F_GETFL, 0);
         fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK);
 
+        // Set SO_REUSEADDR for UDP as well
+        int opt = 1;
+        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
         // Increase socket buffer sizes for better UDP performance
         int buf_size = 1024 * 1024;  // 1MB buffer
         setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
@@ -142,6 +150,7 @@ public:
         while (true) {
             int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
             if (nfds == -1) {
+                if (errno == EINTR) continue;  // Interrupted by signal, continue
                 perror("epoll_wait");
                 break;
             }
@@ -152,7 +161,12 @@ public:
                 } else if (events[i].data.fd == udp_fd) {
                     handle_udp_packet();
                 } else {
-                    handle_tcp_client(events[i].data.fd);
+                    // Check for errors or hangup
+                    if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                        close_client(events[i].data.fd);
+                    } else {
+                        handle_tcp_client(events[i].data.fd);
+                    }
                 }
             }
         }
@@ -163,31 +177,39 @@ private:
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         
-        int client_fd = accept(tcp_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd == -1) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        // Accept multiple connections in one go
+        while (true) {
+            int client_fd = accept(tcp_fd, (struct sockaddr*)&client_addr, &client_len);
+            if (client_fd == -1) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;  // No more pending connections
+                }
+                if (errno == EMFILE || errno == ENFILE) {
+                    std::cerr << "Too many open files - rejecting connection" << std::endl;
+                    break;
+                }
                 perror("accept");
+                break;
             }
-            return;
-        }
 
-        tcp_connections++;
-        if (tcp_connections % 100 == 0) {
-            std::cout << "TCP connections: " << tcp_connections << std::endl;
-        }
+            tcp_connections++;
+            if (tcp_connections % 100 == 0) {
+                std::cout << "TCP connections: " << tcp_connections << std::endl;
+            }
 
-        // Set client socket to non-blocking
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+            // Set client socket to non-blocking
+            int flags = fcntl(client_fd, F_GETFL, 0);
+            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 
-        // Add client to epoll
-        struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.fd = client_fd;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
-            perror("epoll_ctl client");
-            close(client_fd);
-            return;
+            // Add client to epoll with error detection
+            struct epoll_event ev;
+            ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+            ev.data.fd = client_fd;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
+                perror("epoll_ctl client");
+                close(client_fd);
+                continue;
+            }
         }
     }
 
@@ -206,6 +228,11 @@ private:
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         break;
                     }
+                    if (errno == EPIPE) {
+                        // Client disconnected
+                        close_client(client_fd);
+                        return;
+                    }
                     perror("write");
                     close_client(client_fd);
                     return;
@@ -217,9 +244,10 @@ private:
         if (bytes_read == 0) {
             // Client closed connection
             close_client(client_fd);
-        } else if (bytes_read == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("read");
-            close_client(client_fd);
+        } else if (bytes_read == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                close_client(client_fd);
+            }
         }
     }
 
@@ -230,16 +258,22 @@ private:
 
         // Process multiple packets in one go to handle high load
         while (true) {
+            memset(&client_addr, 0, sizeof(client_addr));
+            client_len = sizeof(client_addr);
+            
             ssize_t bytes_read = recvfrom(udp_fd, buffer, sizeof(buffer), 0, 
                                          (struct sockaddr*)&client_addr, &client_len);
             if (bytes_read > 0) {
                 // Echo back the data
-                sendto(udp_fd, buffer, bytes_read, 0, 
-                       (struct sockaddr*)&client_addr, client_len);
-                udp_packets++;
-                
-                if (udp_packets % 1000 == 0) {
-                    std::cout << "UDP packets processed: " << udp_packets << std::endl;
+                ssize_t bytes_sent = sendto(udp_fd, buffer, bytes_read, 0, 
+                                          (struct sockaddr*)&client_addr, client_len);
+                if (bytes_sent == -1) {
+                    perror("UDP sendto");
+                } else {
+                    udp_packets++;
+                    if (udp_packets % 1000 == 0) {
+                        std::cout << "UDP packets processed: " << udp_packets << std::endl;
+                    }
                 }
             } else if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 // No more packets to read
@@ -254,6 +288,7 @@ private:
     void close_client(int client_fd) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
         close(client_fd);
+        tcp_connections--;
     }
 
     void cleanup() {

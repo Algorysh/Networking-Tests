@@ -1,3 +1,14 @@
+// Each client sends as many messages as it can during the test duration (TEST_DURATION_SEC, default 15 seconds).
+// There is no fixed number of messages per client; instead, each client runs a loop sending messages
+// (with a random interval between each message) until the test duration elapses and stop_test is set to true.
+// The number of messages per client is therefore approximately:
+//   (test duration in ms) / (average interval in ms)
+// For TCP: interval is random between 20 and 150 ms (avg ≈ 85 ms)
+// For UDP: interval is random between 10 and 100 ms (avg ≈ 55 ms)
+// So, for TCP: ~15,000 ms / 85 ms ≈ 176 messages per client (on average)
+//     for UDP: ~15,000 ms / 55 ms ≈ 273 messages per client (on average)
+// The actual number will vary due to randomization and system scheduling.
+
 #include <iostream>
 #include <sys/socket.h>
 #include <netinet/in.h>
