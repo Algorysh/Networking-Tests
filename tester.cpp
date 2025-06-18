@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -27,8 +28,8 @@
 #include <iomanip>
 #include <sstream>
 
-const int TCP_PORT = 8080;
-const int UDP_PORT = 8081;
+const int TCP_PORT = 35002;
+const int UDP_PORT = 35001;
 const int BUFFER_SIZE = 1024;
 const char* SERVER_IP = "127.0.0.1";
 
@@ -292,11 +293,16 @@ private:
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock == -1) return;
         
-        // Set socket timeout
+        // Set socket options for better network compatibility
+        int reuse = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        
+        // Set longer timeout for cross-network communication
         struct timeval timeout;
-        timeout.tv_sec = 1;
+        timeout.tv_sec = 5;  // Increased from 1 to 5 seconds
         timeout.tv_usec = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
         
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
@@ -316,22 +322,57 @@ private:
         while (!stop_test) {
             auto request_start = std::chrono::high_resolution_clock::now();
             
-            ssize_t sent = sendto(sock, send_buffer, sizeof(send_buffer), 0, 
-                                 (struct sockaddr*)&server_addr, sizeof(server_addr));
-            if (sent > 0) {
-                socklen_t addr_len = sizeof(server_addr);
-                ssize_t received = recvfrom(sock, recv_buffer, sizeof(recv_buffer), 0,
-                                          (struct sockaddr*)&server_addr, &addr_len);
-                if (received > 0) {
-                    auto request_end = std::chrono::high_resolution_clock::now();
-                    auto latency = std::chrono::duration_cast<std::chrono::microseconds>(request_end - request_start).count() / 1000.0;
+            // Retry logic for UDP packet loss
+            bool success = false;
+            int max_retries = 3;
+            
+            for (int retry = 0; retry < max_retries && !stop_test && !success; ++retry) {
+                ssize_t sent = sendto(sock, send_buffer, sizeof(send_buffer), 0, 
+                                     (struct sockaddr*)&server_addr, sizeof(server_addr));
+                
+                if (sent > 0) {
+                    socklen_t addr_len = sizeof(server_addr);
+                    ssize_t received = recvfrom(sock, recv_buffer, sizeof(recv_buffer), 0,
+                                              (struct sockaddr*)&server_addr, &addr_len);
                     
-                    {
-                        std::lock_guard<std::mutex> lock(results_mutex);
-                        latencies.push_back(latency);
+                    if (received > 0) {
+                        auto request_end = std::chrono::high_resolution_clock::now();
+                        auto latency = std::chrono::duration_cast<std::chrono::microseconds>(request_end - request_start).count() / 1000.0;
+                        
+                        {
+                            std::lock_guard<std::mutex> lock(results_mutex);
+                            latencies.push_back(latency);
+                        }
+                        
+                        total_bytes += sent + received;
+                        success = true;
+                    } else if (received == -1) {
+                        // Handle specific error cases
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // Timeout - this is expected, continue to retry
+                            continue;
+                        } else if (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH) {
+                            // Network/connection issues - break out of retry loop
+                            break;
+                        }
+                        // Other errors - continue to retry
                     }
-                    
-                    total_bytes += sent + received;
+                } else if (sent == -1) {
+                    // Send failed, check errno
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // Socket busy, wait a bit and retry
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        continue;
+                    } else if (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH) {
+                        // Network issues - break out of retry loop
+                        break;
+                    }
+                    // Other send errors - continue to retry
+                }
+                
+                // Small delay between retries
+                if (retry < max_retries - 1) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
             

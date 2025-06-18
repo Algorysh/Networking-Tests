@@ -13,8 +13,8 @@
 
 const int MAX_EVENTS = 1024;
 const int BUFFER_SIZE = 1024;
-const int TCP_PORT = 8080;
-const int UDP_PORT = 8081;
+const int TCP_PORT = 35002;
+const int UDP_PORT = 35001;
 
 class EpollServer {
 private:
