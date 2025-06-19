@@ -10,23 +10,40 @@
 #include <chrono>
 #include <atomic>
 #include <signal.h>
+#include <unordered_map>
 
 const int MAX_EVENTS = 1024;
 const int BUFFER_SIZE = 1024;
 const int TCP_PORT = 8080;
 const int UDP_PORT = 8081;
+const int QUIC_PORT = 8082;
+
+// Basic QUIC connection tracking
+struct QuicConnection {
+    uint32_t connection_id;
+    struct sockaddr_in client_addr;
+    std::chrono::steady_clock::time_point last_activity;
+    bool established;
+    
+    QuicConnection(uint32_t id, const struct sockaddr_in& addr) 
+        : connection_id(id), client_addr(addr), 
+          last_activity(std::chrono::steady_clock::now()), established(false) {}
+};
 
 class EpollServer {
 private:
     int epoll_fd;
     int tcp_fd;
     int udp_fd;
+    int quic_fd;
     struct epoll_event events[MAX_EVENTS];
     std::atomic<int> tcp_connections{0};
     std::atomic<int> udp_packets{0};
+    std::atomic<int> quic_connections{0};
+    std::unordered_map<uint32_t, QuicConnection> quic_connections_map;
 
 public:
-    EpollServer() : epoll_fd(-1), tcp_fd(-1), udp_fd(-1) {}
+    EpollServer() : epoll_fd(-1), tcp_fd(-1), udp_fd(-1), quic_fd(-1) {}
 
     ~EpollServer() {
         cleanup();
@@ -50,6 +67,11 @@ public:
 
         // Setup UDP socket
         if (!setup_udp_socket()) {
+            return false;
+        }
+
+        // Setup QUIC socket
+        if (!setup_quic_socket()) {
             return false;
         }
 
@@ -144,6 +166,50 @@ public:
         return true;
     }
 
+    bool setup_quic_socket() {
+        quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (quic_fd == -1) {
+            perror("QUIC socket");
+            return false;
+        }
+
+        // Set socket to non-blocking
+        int flags = fcntl(quic_fd, F_GETFL, 0);
+        fcntl(quic_fd, F_SETFL, flags | O_NONBLOCK);
+
+        // Set SO_REUSEADDR
+        int opt = 1;
+        setsockopt(quic_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        // Increase socket buffer sizes for better QUIC performance
+        int buf_size = 1024 * 1024;  // 1MB buffer
+        setsockopt(quic_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+        setsockopt(quic_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(QUIC_PORT);
+
+        if (bind(quic_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+            perror("QUIC bind");
+            return false;
+        }
+
+        // Add to epoll
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = quic_fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, quic_fd, &ev) == -1) {
+            perror("epoll_ctl QUIC");
+            return false;
+        }
+
+        std::cout << "QUIC server listening on port " << QUIC_PORT << std::endl;
+        return true;
+    }
+
     void run() {
         std::cout << "Server started. Press Ctrl+C to stop." << std::endl;
         
@@ -160,6 +226,8 @@ public:
                     handle_tcp_connection();
                 } else if (events[i].data.fd == udp_fd) {
                     handle_udp_packet();
+                } else if (events[i].data.fd == quic_fd) {
+                    handle_quic_connection();
                 } else {
                     // Check for errors or hangup
                     if (events[i].events & (EPOLLERR | EPOLLHUP)) {
@@ -285,6 +353,61 @@ private:
         }
     }
 
+    void handle_quic_connection() {
+        char buffer[BUFFER_SIZE];
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        
+        while (true) {
+            ssize_t bytes_received = recvfrom(quic_fd, buffer, BUFFER_SIZE - 1, 0,
+                                            (struct sockaddr*)&client_addr, &client_len);
+            if (bytes_received == -1) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;  // No more data
+                }
+                perror("QUIC recvfrom");
+                break;
+            }
+            
+            if (bytes_received > 0) {
+                buffer[bytes_received] = '\0';
+                
+                // Basic QUIC packet handling - extract connection ID from first 4 bytes
+                uint32_t connection_id = 0;
+                if (bytes_received >= 4) {
+                    memcpy(&connection_id, buffer, sizeof(uint32_t));
+                    connection_id = ntohl(connection_id);
+                }
+                
+                // Track or update connection
+                auto it = quic_connections_map.find(connection_id);
+                if (it == quic_connections_map.end()) {
+                    // New connection
+                    quic_connections_map.emplace(connection_id, QuicConnection(connection_id, client_addr));
+                    quic_connections++;
+                    if (quic_connections % 100 == 0) {
+                        std::cout << "QUIC connections: " << quic_connections << std::endl;
+                    }
+                } else {
+                    // Update existing connection
+                    it->second.last_activity = std::chrono::steady_clock::now();
+                }
+                
+                // Echo response with QUIC header
+                char response[BUFFER_SIZE];
+                memcpy(response, &connection_id, sizeof(uint32_t));
+                memcpy(response + sizeof(uint32_t), "QUIC Echo: ", 11);
+                memcpy(response + sizeof(uint32_t) + 11, buffer + sizeof(uint32_t), 
+                       std::min((size_t)(bytes_received - sizeof(uint32_t)), 
+                               (size_t)(BUFFER_SIZE - sizeof(uint32_t) - 11)));
+                
+                ssize_t response_size = sizeof(uint32_t) + 11 + (bytes_received - sizeof(uint32_t));
+                sendto(quic_fd, response, response_size, 0,
+                       (struct sockaddr*)&client_addr, client_len);
+            }
+        }
+    }
+
     void close_client(int client_fd) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
         close(client_fd);
@@ -294,6 +417,7 @@ private:
     void cleanup() {
         if (tcp_fd != -1) close(tcp_fd);
         if (udp_fd != -1) close(udp_fd);
+        if (quic_fd != -1) close(quic_fd);
         if (epoll_fd != -1) close(epoll_fd);
     }
 };
