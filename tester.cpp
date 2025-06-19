@@ -28,14 +28,16 @@
 #include <iomanip>
 #include <sstream>
 
-const int TCP_PORT = 35002;
-const int UDP_PORT = 35001;
+
+const int TCP_PORT = 8080;
+const int UDP_PORT = 8081;
+const int QUIC_PORT = 8082;
 const int BUFFER_SIZE = 1024;
 const char* SERVER_IP = "127.0.0.1";
 
 // Scalability test configuration
 const int MIN_CLIENTS = 10;
-const int MAX_CLIENTS = 5000;  // Reduce max to avoid resource exhaustion
+const int MAX_CLIENTS = 500;  // Reduce max to avoid resource exhaustion
 const int TEST_DURATION_SEC = 15;  // Duration for each client count test
 const int RAMP_UP_DURATION_SEC = 5;  // Gradual ramp-up per test
 
@@ -94,9 +96,10 @@ public:
         // Write log header
         write_log_header();
         
-        // Test both TCP and UDP
+        // Test TCP, UDP, and QUIC
         run_tcp_scalability();
         run_udp_scalability();
+        run_quic_scalability();
         
         std::cout << "Scalability tests completed. Results logged to " << log_filename << std::endl;
     }
@@ -114,8 +117,8 @@ private:
     void run_tcp_scalability() {
         std::cout << "\n=== TCP Scalability Test ===" << std::endl;
         
-        // Generate client count sequence: 10, 20, 50, 100, 200, 500, 1000, 2000, 5000
-        std::vector<int> client_counts = {10, 20, 50, 100, 200, 500, 1000, 2000, 5000};
+        // Generate client count sequence matching MAX_CLIENTS = 500
+        std::vector<int> client_counts = {10, 20, 50, 100, 200, 500};
         
         for (int client_count : client_counts) {
             std::cout << "Testing TCP with " << client_count << " clients..." << std::endl;
@@ -132,12 +135,29 @@ private:
         std::cout << "\n=== UDP Scalability Test ===" << std::endl;
         
         // Same client count sequence for UDP
-        std::vector<int> client_counts = {10, 20, 50, 100, 200, 500, 1000, 2000, 5000};
+        std::vector<int> client_counts = {10, 20, 50, 100, 200, 500};
         
         for (int client_count : client_counts) {
             std::cout << "Testing UDP with " << client_count << " clients..." << std::endl;
             
             auto result = test_with_client_count("UDP", client_count);
+            log_result(result);
+            
+            // Brief pause between tests
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+    
+    void run_quic_scalability() {
+        std::cout << "\n=== QUIC Scalability Test ===" << std::endl;
+        
+        // Same client count sequence for QUIC
+        std::vector<int> client_counts = {10, 20, 50, 100, 200, 500};
+        
+        for (int client_count : client_counts) {
+            std::cout << "Testing QUIC with " << client_count << " clients..." << std::endl;
+            
+            auto result = test_with_client_count("QUIC", client_count);
             log_result(result);
             
             // Brief pause between tests
@@ -161,8 +181,10 @@ private:
         for (int i = 0; i < client_count; ++i) {
             if (protocol == "TCP") {
                 threads.emplace_back(&ScalabilityTester::tcp_client_worker, this, i);
-            } else {
+            } else if (protocol == "UDP") {
                 threads.emplace_back(&ScalabilityTester::udp_client_worker, this, i);
+            } else if (protocol == "QUIC") {
+                threads.emplace_back(&ScalabilityTester::quic_client_worker, this, i);
             }
             
             // Stagger connection attempts
@@ -383,6 +405,71 @@ private:
         close(sock);
     }
     
+    void quic_client_worker(int client_id) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock == -1) return;
+        
+        // Set socket timeout for reliability
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(QUIC_PORT);
+        inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+        
+        // Generate unique connection ID for this client
+        uint32_t connection_id = htonl(client_id + 1000);
+        
+        connections++;
+        active_connections++;
+        
+        // Update peak connections
+        int current = active_connections;
+        int expected = peak_connections;
+        while (current > expected && !peak_connections.compare_exchange_weak(expected, current)) {
+            expected = peak_connections;
+        }
+        
+        while (!stop_test) {
+            // Create QUIC packet with connection ID header
+            char message[BUFFER_SIZE];
+            memcpy(message, &connection_id, sizeof(uint32_t));
+            snprintf(message + sizeof(uint32_t), BUFFER_SIZE - sizeof(uint32_t), "QUIC Client %d Message", client_id);
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            
+            ssize_t sent = sendto(sock, message, sizeof(uint32_t) + strlen(message + sizeof(uint32_t)), 0,
+                                (struct sockaddr*)&server_addr, sizeof(server_addr));
+            if (sent > 0) {
+                char response[BUFFER_SIZE];
+                socklen_t addr_len = sizeof(server_addr);
+                ssize_t received = recvfrom(sock, response, BUFFER_SIZE, 0,
+                                          (struct sockaddr*)&server_addr, &addr_len);
+                if (received > 0) {
+                    auto end = std::chrono::high_resolution_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(results_mutex);
+                        latencies.push_back(duration.count() / 1000.0);  // Convert to milliseconds
+                        total_bytes += sent + received;
+                    }
+                }
+            }
+            
+            // Random interval between QUIC messages (10-80 ms)
+            std::uniform_int_distribution<int> dist(10, 80);
+            std::this_thread::sleep_for(std::chrono::milliseconds(dist(rng)));
+        }
+        
+        active_connections--;
+        close(sock);
+    }
+    
     std::vector<double> calculate_all_percentiles(const std::vector<double>& data) {
         if (data.empty()) {
             return std::vector<double>(100, 0.0);
@@ -422,16 +509,24 @@ private:
         // Determine protocol from context
         std::string protocol = "TCP";  // Default to TCP
         static bool tcp_done = false;
+        static bool udp_done = false;
         static int tcp_tests_completed = 0;
+        static int udp_tests_completed = 0;
         
         if (!tcp_done) {
             protocol = "TCP";
             tcp_tests_completed++;
-            if (tcp_tests_completed >= 9) {  // 9 TCP tests (10,20,50,100,200,500,1000,2000,5000)
+            if (tcp_tests_completed >= 5) {  // 5 TCP tests (10,20,50,100,200,500)
                 tcp_done = true;
             }
-        } else {
+        } else if (!udp_done) {
             protocol = "UDP";
+            udp_tests_completed++;
+            if (udp_tests_completed >= 5) {  // 5 UDP tests (10,20,50,100,200,500)
+                udp_done = true;
+            }
+        } else {
+            protocol = "QUIC";
         }
         
         // Print to console
@@ -464,4 +559,4 @@ int main() {
     tester.run_scalability_tests();
     
     return 0;
-} 
+}
