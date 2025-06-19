@@ -1,7 +1,7 @@
 # Networking-Tests
 
 ## What is this?
-A simple framework to test network protocols for Speed (Latency and Thrpt) and Reliability.
+A simple framework to test network protocols for Speed (Latency and Thrpt) and Reliability. It currently tests TCP vs UDP vs QUIC.
 ## How to do it?
 run `make` and then `make test`
 It'll automatically run the test, gradually scaling the load to 5000 simultaneous clients and save the results in `results/`
